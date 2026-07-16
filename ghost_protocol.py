@@ -981,6 +981,7 @@ class GhostProtocolUnified:
 
                 cleaned_data = bytearray(data)
 
+                # JPEG format
                 if cleaned_data[:2] == b'\xff\xd8':
                     pos = 2
                     out = bytearray(b'\xff\xd8')
@@ -1012,12 +1013,31 @@ class GhostProtocolUnified:
                             out.append(cleaned_data[pos])
                             pos += 1
                     cleaned_data = out
+                    self.log(f"Stripped EXIF from JPEG: {os.path.basename(fp)}", "success")
+                    stripped += 1
+
+                # PNG format
+                elif cleaned_data[:8] == b'\x89PNG\r\n\x1a\n':
+                    pos = 8
+                    out = bytearray(b'\x89PNG\r\n\x1a\n')
+                    # Safe chunks we want to preserve
+                    safe_chunks = {b'IHDR', b'PLTE', b'IDAT', b'IEND', b'tRNS', b'gAMA', b'cHRM', b'sRGB'}
+                    while pos < len(cleaned_data) - 8:
+                        length = int.from_bytes(cleaned_data[pos:pos+4], "big")
+                        chunk_type = cleaned_data[pos+4:pos+8]
+                        if chunk_type in safe_chunks:
+                            out.extend(cleaned_data[pos:pos+12+length])
+                        pos += 12 + length
+                    cleaned_data = out
+                    self.log(f"Stripped metadata from PNG: {os.path.basename(fp)}", "success")
+                    stripped += 1
+                else:
+                    self.log(f"Unsupported format or no metadata in {os.path.basename(fp)}", "warning")
+                    continue
 
                 with open(fp, "wb") as f:
                     f.write(cleaned_data)
 
-                self.log(f"Stripped EXIF from {os.path.basename(fp)}", "success")
-                stripped += 1
             except Exception as e:
                 self.log(f"EXIF error on {os.path.basename(fp)}: {e}", "error")
 
@@ -1137,8 +1157,39 @@ class GhostProtocolUnified:
         if self.tor_process and self.tor_process.poll() is None:
             self.log("Tor is already active.", "warning")
             return
+
+        # Check if port 9050 is already in use
+        port_occupied = False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1.0)
+                if s.connect_ex(("127.0.0.1", 9050)) == 0:
+                    port_occupied = True
+        except Exception:
+            pass
+
+        if port_occupied:
+            self.log("Port 9050 active. Verifying if Tor/SOCKS5 proxy is listening...", "info")
+            try:
+                # SOCKS5 Greeting: version 5, 1 auth method (no auth)
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(1.5)
+                    s.connect(("127.0.0.1", 9050))
+                    s.sendall(b"\x05\x01\x00")
+                    resp = s.recv(2)
+                    if resp == b"\x05\x00":
+                        self.log("Existing Tor/SOCKS5 service detected on port 9050. Reusing it.", "success")
+                        self.root.after(0, lambda: self.tor_status_dot.set_color(COLORS["accent_green"]))
+                        if self.toggles["tor"].is_on:
+                            self.configure_tor_proxies(True)
+                        return
+            except Exception:
+                pass
+            self.log("Port 9050 occupied by a non-Tor service. Cannot start Tor.", "error")
+            return
+
         if not self.tor_bin:
-            self.log("Tor binary path missing.", "error")
+            self.log("Tor not found. Please install Tor ('brew install tor').", "warning")
             return
 
         torrc_path = self.generate_temp_torrc()
@@ -1226,15 +1277,23 @@ class GhostProtocolUnified:
 
     def new_tor_identity(self):
         """Request a new Tor circuit (new IP) via SIGNAL NEWNYM on the control port."""
-        if not self.tor_process or self.tor_process.poll() is not None:
-            self.log("Tor is not running. Start Tor first.", "warning")
+        tor_active = False
+        if self.tor_process and self.tor_process.poll() is None:
+            tor_active = True
+        else:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(1.0)
+                    if s.connect_ex(("127.0.0.1", 9051)) == 0:
+                        tor_active = True
+            except Exception:
+                pass
+
+        if not tor_active:
+            self.log("Tor control port (9051) is not responsive. Start Tor first.", "warning")
             return
 
-        if not self._tor_control_password:
-            self.log("No control password set. Restart Tor to enable identity switching.", "error")
-            return
-
-        self.log("Requesting new Tor identity (NEWNYM)...", "info")
+        self.log("Connecting to Tor control port (9051)...", "info")
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5)
@@ -1243,11 +1302,40 @@ class GhostProtocolUnified:
             # Read greeting
             sock.recv(1024)
 
-            # Authenticate
-            sock.sendall(f'AUTHENTICATE "{self._tor_control_password}"\r\n'.encode())
-            auth_resp = sock.recv(1024).decode()
-            if "250" not in auth_resp:
-                self.log(f"Control port auth failed: {auth_resp.strip()}", "error")
+            # Authenticate: try session password, then empty string
+            auth_success = False
+            for passwd in [self._tor_control_password, ""]:
+                if passwd is None:
+                    continue
+                sock.sendall(f'AUTHENTICATE "{passwd}"\r\n'.encode())
+                auth_resp = sock.recv(1024).decode()
+                if "250" in auth_resp:
+                    auth_success = True
+                    break
+
+            if not auth_success:
+                # Try cookie authentication if cookie file exists
+                cookie_paths = [
+                    "/opt/homebrew/var/lib/tor/control_auth_cookie",
+                    "/usr/local/var/lib/tor/control_auth_cookie",
+                    os.path.expanduser("~/Library/Application Support/Tor/control_auth_cookie"),
+                ]
+                for cp in cookie_paths:
+                    if os.path.exists(cp):
+                        try:
+                            with open(cp, "rb") as f:
+                                cookie_data = f.read()
+                            hex_cookie = cookie_data.hex().upper()
+                            sock.sendall(f"AUTHENTICATE {hex_cookie}\r\n".encode())
+                            auth_resp = sock.recv(1024).decode()
+                            if "250" in auth_resp:
+                                auth_success = True
+                                break
+                        except Exception:
+                            pass
+
+            if not auth_success:
+                self.log("Control port authentication failed. Start Tor using Ghost Protocol.", "error")
                 sock.close()
                 return
 
@@ -1258,17 +1346,18 @@ class GhostProtocolUnified:
             sock.close()
 
             if "250" in newnym_resp:
-                self.log("New identity requested. Circuit will rebuild in ~10s.", "success")
-                # Wait for new circuit and show new IP
-                time.sleep(3)
+                self.log("New Tor identity requested. Rebuilding circuit...", "success")
+                for i in range(5, 0, -1):
+                    self.log(f"Rebuilding circuit... testing connection in {i}s", "info")
+                    time.sleep(1)
                 self.test_tor()
             else:
                 self.log(f"NEWNYM failed: {newnym_resp.strip()}", "error")
 
         except ConnectionRefusedError:
-            self.log("Control port (9051) refused. Is Tor running?", "error")
+            self.log("Control port (9051) refused connection.", "error")
         except socket.timeout:
-            self.log("Control port timed out.", "error")
+            self.log("Control port connection timed out.", "error")
         except Exception as e:
             self.log(f"Identity switch error: {e}", "error")
 
@@ -1293,17 +1382,38 @@ class GhostProtocolUnified:
 
     def shred_add_directory(self):
         directory = filedialog.askdirectory(title="Select Directory to Shred")
-        if directory:
+        if not directory:
+            return
+
+        self.log("Scanning directory in background...", "info")
+
+        def scan():
             added = 0
+            temp_list = []
             for root_dir, _, filenames in os.walk(directory):
                 for filename in filenames:
                     filepath = os.path.join(root_dir, filename)
                     if filepath not in self.shred_list:
-                        self.shred_list.append(filepath)
-                        self.shred_listbox.insert(tk.END, filepath)
+                        temp_list.append(filepath)
                         added += 1
-            self._update_shred_count()
-            self.log(f"Scanned dir. Added {added} items.", "info")
+
+            def update_ui_batch(start_idx=0):
+                batch_size = 200
+                end_idx = min(start_idx + batch_size, len(temp_list))
+                for idx in range(start_idx, end_idx):
+                    fp = temp_list[idx]
+                    self.shred_list.append(fp)
+                    self.shred_listbox.insert(tk.END, fp)
+
+                if end_idx < len(temp_list):
+                    self.root.after(10, lambda: update_ui_batch(end_idx))
+                else:
+                    self._update_shred_count()
+                    self.log(f"Directory scan completed. Added {added} items.", "success")
+
+            self.root.after(0, lambda: update_ui_batch(0))
+
+        threading.Thread(target=scan, daemon=True).start()
 
     def shred_remove_selected(self):
         selected_indices = self.shred_listbox.curselection()
@@ -1330,17 +1440,20 @@ class GhostProtocolUnified:
         total = len(self.shred_list)
         self.log(f"Shredding {total} files ({passes} passes)...", "warning")
         for filepath in list(self.shred_list):
+            # Always pop from listbox in sync with loop
+            def remove_first():
+                if self.shred_listbox.size() > 0:
+                    self.shred_listbox.delete(0)
+            self.root.after(0, remove_first)
+
             if not os.path.exists(filepath):
+                self.log(f"Skipped (not found): {os.path.basename(filepath)}", "warning")
                 continue
             try:
                 size = os.path.getsize(filepath)
                 if size == 0:
                     os.remove(filepath)
                     self.log(f"Removed empty: {os.path.basename(filepath)}", "success")
-                    def remove_first_empty():
-                        if self.shred_listbox.size() > 0:
-                            self.shred_listbox.delete(0)
-                    self.root.after(0, remove_first_empty)
                     continue
                 with open(filepath, "wb+") as f:
                     for p in range(passes):
@@ -1359,11 +1472,6 @@ class GhostProtocolUnified:
                 os.rename(filepath, obscured)
                 os.remove(obscured)
                 self.log(f"Shredded: {os.path.basename(filepath)}", "success")
-
-                def remove_first():
-                    if self.shred_listbox.size() > 0:
-                        self.shred_listbox.delete(0)
-                self.root.after(0, remove_first)
             except Exception as e:
                 self.log(f"Failed to shred {filepath}: {e}", "error")
         self.shred_list.clear()
@@ -1632,6 +1740,47 @@ class GhostProtocolUnified:
         except Exception as e:
             self.log(f"Clipboard error: {e}", "error")
 
+    def force_kill_browser(self, browser):
+        browser_map = {
+            "Safari": "Safari",
+            "Google Chrome": "Google Chrome",
+            "Firefox": "firefox",
+            "Brave Browser": "Brave Browser"
+        }
+        proc = browser_map.get(browser)
+        if not proc:
+            return
+        
+        self.log(f"Force killing {browser}...", "warning")
+        # Try multiple force-kill approaches to guarantee closure
+        subprocess.run(["pkill", "-9", "-x", proc], capture_output=True)
+        subprocess.run(["killall", "-9", proc], capture_output=True)
+        if "Brave" in browser:
+            subprocess.run(["pkill", "-9", "-f", "Brave Browser"], capture_output=True)
+        elif "Chrome" in browser:
+            subprocess.run(["pkill", "-9", "-f", "Google Chrome"], capture_output=True)
+
+    def ensure_and_enable_tor(self):
+        # Check if Tor is active
+        tor_active = False
+        if self.tor_process and self.tor_process.poll() is None:
+            tor_active = True
+        else:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.5)
+                    if s.connect_ex(("127.0.0.1", 9050)) == 0:
+                        tor_active = True
+            except Exception:
+                pass
+
+        if not tor_active:
+            self.log("Tor proxy enabled but daemon not running. Launching local Tor...", "info")
+            self.enable_tor()
+            time.sleep(1.0)
+            
+        self.configure_tor_proxies(True)
+
     # ── Protocol Execution Runner ────────────────────────────────────────
     def start_protocol_execution(self):
         if self.toggles["browsers"].is_on:
@@ -1659,18 +1808,9 @@ class GhostProtocolUnified:
                         ans_force = messagebox.askyesno("Force Close Browsers?", 
                                                          f"Some browsers failed to close: {', '.join(still_running)}.\n\nWould you like to force close them? Warning: Unsaved changes will be lost.")
                         if ans_force:
-                            self.log("Force closing browsers...", "warning")
-                            browser_map = {
-                                "Safari": "Safari",
-                                "Google Chrome": "Google Chrome",
-                                "Firefox": "firefox",
-                                "Brave Browser": "Brave Browser"
-                             }
                             for browser in still_running:
-                                proc = browser_map.get(browser)
-                                if proc:
-                                    subprocess.run(["killall", "-9", proc], capture_output=True)
-                            time.sleep(1)
+                                self.force_kill_browser(browser)
+                            time.sleep(1.0)
                             still_running = self.verify_active_browsers()
                             if still_running:
                                 messagebox.showerror("Error", f"Failed to close browsers: {', '.join(still_running)}")
@@ -1705,7 +1845,7 @@ class GhostProtocolUnified:
             return
 
         task_map = {
-            "tor": lambda: self.configure_tor_proxies(True),
+            "tor": self.ensure_and_enable_tor,
             "dns": self.flush_dns,
             "term": self.scrub_terminals,
             "clip": self.erase_clipboard,
