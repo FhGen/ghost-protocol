@@ -1,12 +1,12 @@
-# Ghost Protocol — Absolute macOS Privacy & Anti-Forensics Suite
+# Ghost Protocol — macOS Privacy, Anti-Forensics & Secure Tor Routing Suite
 
-Ghost Protocol is a high-security local privacy dashboard, system hardening utility, and anti-forensics console tailored specifically for macOS. It provides a suite of advanced operations to audit, scrub, and protect your digital footprint.
+Ghost Protocol is a high-security, local privacy dashboard, system hardening utility, and anti-forensics console tailored specifically for macOS. It provides a suite of advanced operations to audit, scrub, and protect your digital footprint.
 
 ---
 
 ## 🛠️ System Architecture
 
-Ghost Protocol is structured into three distinct operational domains: **User Interface & Graphics Engine**, **Hardened Anonymous Routing (Tor Engine)**, and **Local Privacy & Clean-Up Routines**.
+Ghost Protocol is structured into four distinct operational domains: **User Interface & Graphics Engine**, **Hardened Anonymous Routing (Tor Engine)**, **Local Privacy & Clean-Up Routines**, and **Anti-Forensics & Shredder Subsystems**.
 
 ```
                   ┌──────────────────────┐
@@ -31,7 +31,7 @@ Ghost Protocol is structured into three distinct operational domains: **User Int
          └─────────────┐     ▼     ┌─────────────┘
                        ▼           ▼
                   ┌──────────────────────┐
-                  │    Local Tor Daemon  │
+                  │    Local Tor Daemon  │ (Autodetects or binds to port 9050)
                   └──────────┬───────────┘
                              │ (Binds to SOCKS port 9050)
                              ▼
@@ -54,19 +54,20 @@ The visual theme is custom-built on top of Tkinter's basic Canvas renderer using
 
 ### Layout & Navigation
 *   **Tabbed Interface**: The right panel maps frames dynamically (`self._tab_frames`) when switching tabs, providing single-pane window navigation between Console, Tor Config, and Shredder.
-*   **Colored Audit Trail**: Logs are piped to a custom `tk.Text` element configured with tagging parameters to dynamically color output strings depending on success, warning, or error signals.
+*   **Colored Audit Trail**: Logs are piped to a custom `tk.Text` element configured with tagging parameters to dynamically color output strings depending on success, warning, or error signals. Starts in a read-only (`DISABLED`) state to protect audit integrity.
 
 ---
 
 ## 2. Hardened Anonymous Routing (Tor Engine)
-This subsystem handles the initialization, configuration template generation, and management of the local Tor process, along with binding macOS proxy configurations.
+This subsystem handles the initialization, configuration template generation, SOCKS5 validation, and management of the local Tor process, along with binding macOS proxy configurations.
 
+*   **Smart SOCKS5 Port Binding**: Before spawning a local daemon, Ghost Protocol checks if port `9050` is active. If occupied, it initiates a SOCKS5 handshake. If verified as an active Tor proxy, it seamlessly reuses the connection, preventing double-binding conflicts.
 *   **Exit Node Resolver**: Connects to the Tor Metrics API (`Onionoo`) asynchronously to fetch the top 50 active exit relays sorted by consensus weight. Details are parsed into country codes and mapped to their exact 40-character fingerprints.
 *   **`torrc` Generation**: Translates UI toggle configurations into strict configuration directives:
     *   `Exclude 5-Eyes`: Resolves US, UK, CA, AU, NZ country codes (`{us},{gb},{ca},{au},{nz}`) and maps them to `ExcludeNodes` and `ExcludeExitNodes`.
     *   `Safe SOCKS`: Disables unsafe DNS resolutions by writing `SafeSocks 1` and `TestSocks 1`.
     *   `Daemon Hardening`: Generates configuration blocks enabling `SafeLogging 1`, `DisableDebuggerAttachment 1` (blocking `ptrace` attachments), and blocks internal address proxy requests (`ClientRejectInternalAddresses`).
-*   **macOS Network Integration**: Automates `networksetup` system calls to query active network adapters (`-listallnetworkservices`) and apply system-wide SOCKS proxy settings redirection to the local loopback interface (`127.0.0.1:9050`).
+*   **Control Port IP Switching (NEWNYM)**: When requesting a **🔄 NEW IP**, the suite communicates with the Tor Control Port (`9051`) using a random session-generated authentication password or reading Mac Homebrew cookie files (`control_auth_cookie`), sending a `SIGNAL NEWNYM` request. It displays a real-time countdown as the circuit rebuilds.
 
 ---
 
@@ -75,10 +76,22 @@ Automates sanitization runs to clean local application footprints and scrub meta
 
 *   **DNS & RAM Purger**: Issues `dscacheutil -flushcache` and signals `mDNSResponder` to drop resolved hostname tables. A subsystem call triggers macOS `purge` to clear volatile inactive memory buffers.
 *   **Terminal History Cleaner**: Wipes command files across primary shells (Bash, Zsh, Sh, Python, and SQLite command buffers) by truncating target files on disk.
-*   **Browser Nuker**: Performs structural detection of history, session caches, and SQL cookie stores for Safari, Google Chrome, Mozilla Firefox, and Brave Browser. If active instances are running, it blocks cleaning to prevent data corruption.
-*   **Anti-Forensics Secure File Shredder**: Securely overwrites file buffers (1-pass Fast, 3-pass DoD Standard, 7-pass Gutmann, or 35-pass Maximum), renames them to random strings, and deletes them to prevent forensic recovery.
-*   **EXIF Metadata Stripper**: Reads raw image byte structures to detect JPEG and PNG markers. For JPEGs, it parses markers segment-by-segment and strips application markers (`APP0` through `APP15` segments which contain EXIF data, GPS coordinates, and camera profiles) while preserving the basic image array segments.
-*   **Emergency Panic**: Triggers instant memory scrubbing, clears the OS clipboard memory buffer, resets SOCKS firewall routing states, kills the local Tor sub-daemon, and closes the application instantly.
+*   **Multi-Tiered Browser Force-Quit**: If active browsers (Safari, Google Chrome, Firefox, Brave Browser) are running during cleanup, the engine prompts the user and escalates closure:
+    1. Sends graceful AppleScript `quit` events to preserve application state.
+    2. Escalates to `pkill -9 -x` (exact case-sensitive matching).
+    3. Triggers `killall -9`.
+    4. Automatically kills underlying WebKit/Chrome helper sub-daemons.
+*   **TCC Permission Escalation**: When cleaning sandbox directories (such as Safari's protected `History.db`), standard permission blocks (`EPERM`) are handled by escalating the deletion run to admin `rm` via AppleScript. If system-level Full Disk Access is still missing, detailed setup guidance is logged in the console.
+
+---
+
+## 4. Anti-Forensics & Shredder Subsystems
+
+*   **Secured File Overwriter**: Securely overwrites file buffers (1-pass Fast, 3-pass DoD Standard, 7-pass Gutmann, or 35-pass Maximum), renames them to random strings, and deletes them to prevent forensic recovery. The listbox is updated in sync to prevent file desync errors.
+*   **Non-Blocking Directory Walk**: Scanning directories with large quantities of files runs entirely on a background thread. Found paths are queued and loaded in batches of 200 items into the Tkinter listbox using `after()` callbacks, preventing GUI freezes.
+*   **EXIF & Metadata Stripper**:
+    *   **JPEGs**: Parses image segments chunk-by-chunk and removes application metadata blocks (`APP0` through `APP15` segments containing EXIF data, GPS coordinates, and camera profiles).
+    *   **PNGs**: Implements a custom PNG chunk layout parser. It reads the PNG 8-byte signature (`\x89PNG\r\n\x1a\n`) and filters out auxiliary metadata chunks (like `tEXt`, `zTXt`, `iTXt`, `eXIf`, `iCCP`) while preserving standard visual render chunks (`IHDR`, `PLTE`, `IDAT`, `IEND`, `tRNS`, `gAMA`, `cHRM`, `sRGB`).
 
 ---
 
@@ -89,5 +102,9 @@ Automates sanitization runs to clean local application footprints and scrub meta
 - **Core Dependencies**: Python 3.10+, Tkinter.
 - **Tor Integration**: Requires Tor binary (`brew install tor`).
 
-### Dynamic Privilege Elevation
-The application utilizes AppleScript system elevation dialogs (`osascript -e "do shell script with administrator privileges"`) to authenticate specific administrative tasks. This allows you to run the GUI program normally as a standard user, prompting Touch ID or your password only when necessary (e.g. for `/etc/hosts` changes).
+### Execution
+Run the unified script directly via your terminal:
+```bash
+python3 ghost_protocol.py
+```
+*Tip: Ensure you grant **Full Disk Access** to Terminal (or your packaged App) in System Settings to allow complete cleaning of browser cache data.*
