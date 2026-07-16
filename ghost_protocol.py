@@ -56,13 +56,11 @@ FONTS = {
 }
 
 # Fallback fonts for systems without SF Pro
-def _verify_fonts():
-    """Replace SF fonts with available alternatives."""
+def _verify_fonts(root):
+    """Replace SF fonts with available alternatives using the existing Tk root."""
     try:
-        test = tk.Tk()
-        test.withdraw()
-        available = list(tk.font.families())
-        test.destroy()
+        import tkinter.font
+        available = list(tkinter.font.families(root))
     except Exception:
         available = []
 
@@ -283,8 +281,7 @@ class GhostProtocolUnified:
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
 
         try:
-            import tkinter.font
-            _verify_fonts()
+            _verify_fonts(self.root)
         except Exception:
             pass
 
@@ -426,10 +423,11 @@ class GhostProtocolUnified:
         canvas.create_window((0, 0), window=self.toggles_frame, anchor="nw", tags="frame")
         canvas.configure(yscrollcommand=scroll.set)
 
-        # Resize inner frame to match canvas width
-        def _resize_frame(event):
+        # Resize inner frame to match canvas width AND update scrollregion
+        def _on_canvas_configure(event):
             canvas.itemconfig("frame", width=event.width)
-        canvas.bind("<Configure>", _resize_frame)
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        canvas.bind("<Configure>", _on_canvas_configure)
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
         scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 2), pady=4)
@@ -512,8 +510,8 @@ class GhostProtocolUnified:
                            padx=14, pady=8, cursor="hand2")
             btn.pack(side=tk.LEFT)
             btn.bind("<Button-1>", lambda e, k=tab_key: self._switch_tab(k))
-            btn.bind("<Enter>", lambda e, b=btn: b.config(fg=COLORS["text_primary"]) if b != self._tab_buttons.get(self._active_tab) else None)
-            btn.bind("<Leave>", lambda e, b=btn, k=tab_key: b.config(fg=COLORS["text_dim"]) if k != self._active_tab else None)
+            btn.bind("<Enter>", lambda e, k=tab_key: self._tab_buttons[k].config(fg=COLORS["text_primary"]) if k != self._active_tab else None)
+            btn.bind("<Leave>", lambda e, k=tab_key: self._tab_buttons[k].config(fg=COLORS["text_dim"]) if k != self._active_tab else None)
             self._tab_buttons[tab_key] = btn
 
         # Content area
@@ -571,7 +569,8 @@ class GhostProtocolUnified:
                                 fg=COLORS["accent_green"], font=FONTS["mono"],
                                 bd=0, highlightthickness=0, padx=12, pady=10,
                                 insertbackground=COLORS["accent_green"],
-                                selectbackground=COLORS["bg_elevated"])
+                                selectbackground=COLORS["bg_elevated"],
+                                state=tk.DISABLED)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         console_scroll = ttk.Scrollbar(console_frame, orient="vertical",
@@ -741,6 +740,11 @@ class GhostProtocolUnified:
             bd=0, highlightthickness=0, activestyle="none")
         self.shred_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
 
+        # File count label at bottom
+        self.shred_count_label = tk.Label(list_frame, text="0 files queued",
+            font=FONTS["status"], fg=COLORS["text_dim"], bg=COLORS["bg_deepest"], anchor="w")
+        self.shred_count_label.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 4))
+
         list_scroll = ttk.Scrollbar(list_frame, orient="vertical",
             command=self.shred_listbox.yview, style="Dark.Vertical.TScrollbar")
         list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -859,6 +863,7 @@ class GhostProtocolUnified:
         if self.exit_country_var.get() == "Custom":
             self.custom_exit_entry.config(state="normal")
         else:
+            self.custom_exit_entry.config(state="normal")
             self.custom_exit_entry.delete(0, tk.END)
             self.custom_exit_entry.config(state="disabled")
 
@@ -1182,20 +1187,28 @@ class GhostProtocolUnified:
                     data = json.loads(res.stdout)
                     if data.get("IsTor", False):
                         self.log(f"Tor ACTIVE — IP: {data.get('IP', '?')}", "success")
+                        self.root.after(0, lambda: self.tor_status_dot.set_color(COLORS["accent_green"]))
                     else:
                         self.log("Proxy responded but traffic not Tor-routed.", "warning")
+                        self.root.after(0, lambda: self.tor_status_dot.set_color(COLORS["accent_orange"]))
                 except json.JSONDecodeError:
                     self.log("Proxy responded with non-JSON data.", "warning")
             else:
                 self.log("Tor proxy port unresponsive.", "error")
+                self.root.after(0, lambda: self.tor_status_dot.set_color(COLORS["accent_red"]))
         except Exception as e:
             self.log(f"Connectivity check failed: {e}", "error")
+            self.root.after(0, lambda: self.tor_status_dot.set_color(COLORS["accent_red"]))
 
     def on_tor_toggle(self, is_on):
         if not is_on:
             self.configure_tor_proxies(False)
 
     # ── Shredder Operations ──────────────────────────────────────────────
+    def _update_shred_count(self):
+        count = len(self.shred_list)
+        self.shred_count_label.config(text=f"{count} file{'s' if count != 1 else ''} queued")
+
     def shred_add_files(self):
         files = filedialog.askopenfilenames(title="Select Files to Shred")
         if files:
@@ -1203,6 +1216,7 @@ class GhostProtocolUnified:
                 if f not in self.shred_list:
                     self.shred_list.append(f)
                     self.shred_listbox.insert(tk.END, f)
+            self._update_shred_count()
             self.log(f"Added {len(files)} files to queue.", "info")
 
     def shred_add_directory(self):
@@ -1216,6 +1230,7 @@ class GhostProtocolUnified:
                         self.shred_list.append(filepath)
                         self.shred_listbox.insert(tk.END, filepath)
                         added += 1
+            self._update_shred_count()
             self.log(f"Scanned dir. Added {added} items.", "info")
 
     def shred_remove_selected(self):
@@ -1228,11 +1243,13 @@ class GhostProtocolUnified:
             if file_path in self.shred_list:
                 self.shred_list.remove(file_path)
             self.shred_listbox.delete(idx)
+        self._update_shred_count()
         self.log("Removed selected items.", "info")
 
     def shred_clear_queue(self):
         self.shred_list.clear()
         self.shred_listbox.delete(0, tk.END)
+        self._update_shred_count()
         self.log("Queue cleared.", "info")
 
     def execute_shredder(self, passes=3):
@@ -1278,6 +1295,7 @@ class GhostProtocolUnified:
             except Exception as e:
                 self.log(f"Failed to shred {filepath}: {e}", "error")
         self.shred_list.clear()
+        self.root.after(0, self._update_shred_count)
 
     # ── Clean & Privacy System Actions ───────────────────────────────────
     def flush_dns(self):
@@ -1445,8 +1463,7 @@ class GhostProtocolUnified:
         self.log("Scanning for active browsers...", "info")
         running_list = self.verify_active_browsers()
         if running_list:
-            self.log(f"Active browsers: {', '.join(running_list)}", "error")
-            self.log("Close browsers before sanitizing.", "warning")
+            self.log(f"Skipping — browsers still open: {', '.join(running_list)}", "warning")
             return
 
         self.log("Sanitizing browser data...", "info")
@@ -1517,7 +1534,7 @@ class GhostProtocolUnified:
         try:
             process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE, close_fds=True)
             process.communicate(input=b"")
-            self.root.clipboard_clear()
+            self.root.after(0, self.root.clipboard_clear)
             self.log("Clipboard cleared.", "success")
         except Exception as e:
             self.log(f"Clipboard error: {e}", "error")
@@ -1630,11 +1647,13 @@ class GhostProtocolUnified:
             self.root.after(0, lambda: self.progress_bar.config(value=100))
 
         self.log("ALL PROTOCOLS COMPLETED.", "success")
-        self.root.after(0, lambda: self.btn_execute.set_disabled(False))
-        def reset_text():
+        def reset_ui():
+            self.btn_execute.set_disabled(False)
             self.btn_execute._text = "⚡ EXECUTE PRIVACY PROTOCOL"
             self.btn_execute._redraw()
-        self.root.after(0, reset_text)
+        self.root.after(0, reset_ui)
+        # Reset progress bar after a short delay so user sees 100% briefly
+        self.root.after(2000, lambda: self.progress_bar.config(value=0))
 
     # ── Shutdown & Cleanup ───────────────────────────────────────────────
     def force_safe_shutdown(self):
