@@ -1428,19 +1428,15 @@ class GhostProtocolUnified:
     def verify_active_browsers(self):
         """Returns list of running browser names."""
         running = []
-        browsers_pcmd = {
-            "Safari": "Safari",
-            "Google Chrome": "Google Chrome",
-            "Firefox": "firefox",
-            "Brave Browser": "Brave Browser"
-        }
-        for name, proc in browsers_pcmd.items():
+        browsers = ["Safari", "Google Chrome", "Firefox", "Brave Browser"]
+        for browser in browsers:
             try:
-                res = subprocess.run(["pgrep", "-x", proc], capture_output=True)
-                if res.returncode != 0:
-                    res = subprocess.run(["pgrep", "-f", proc], capture_output=True)
-                if res.returncode == 0:
-                    running.append(name)
+                res = subprocess.run(
+                    ["osascript", "-e", f'application "{browser}" is running'],
+                    capture_output=True, text=True
+                )
+                if res.stdout.strip() == "true":
+                    running.append(browser)
             except Exception:
                 pass
         return running
@@ -1528,6 +1524,54 @@ class GhostProtocolUnified:
 
     # ── Protocol Execution Runner ────────────────────────────────────────
     def start_protocol_execution(self):
+        if self.toggles["browsers"].is_on:
+            running_list = self.verify_active_browsers()
+            if running_list:
+                ans = messagebox.askyesno("Active Browsers Detected", 
+                                         f"The following browsers are running: {', '.join(running_list)}.\n\nWould you like Ghost Protocol to close them and proceed with cleaning?")
+                if ans:
+                    self.log("Attempting to close active browsers gracefully...", "info")
+                    for browser in running_list:
+                        subprocess.run(["osascript", "-e", f'tell application "{browser}" to quit'])
+                    
+                    # Wait up to 5 seconds
+                    closed_all = False
+                    for _ in range(10):
+                        self.root.update()
+                        time.sleep(0.5)
+                        still_running = self.verify_active_browsers()
+                        if not still_running:
+                            closed_all = True
+                            break
+                    
+                    if not closed_all:
+                        still_running = self.verify_active_browsers()
+                        ans_force = messagebox.askyesno("Force Close Browsers?", 
+                                                         f"Some browsers failed to close: {', '.join(still_running)}.\n\nWould you like to force close them? Warning: Unsaved changes will be lost.")
+                        if ans_force:
+                            self.log("Force closing browsers...", "warning")
+                            browser_map = {
+                                "Safari": "Safari",
+                                "Google Chrome": "Google Chrome",
+                                "Firefox": "firefox",
+                                "Brave Browser": "Brave Browser"
+                             }
+                            for browser in still_running:
+                                proc = browser_map.get(browser)
+                                if proc:
+                                    subprocess.run(["killall", "-9", proc], capture_output=True)
+                            time.sleep(1)
+                            still_running = self.verify_active_browsers()
+                            if still_running:
+                                messagebox.showerror("Error", f"Failed to close browsers: {', '.join(still_running)}")
+                                return
+                        else:
+                            self.log("Protocol aborted by user due to active browsers.", "warning")
+                            return
+                else:
+                    self.log("Protocol aborted by user.", "warning")
+                    return
+
         self.btn_execute.set_disabled(True)
         self.btn_execute._text = "⏳ EXECUTING..."
         self.btn_execute._redraw()
