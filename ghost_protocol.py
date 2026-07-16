@@ -1516,6 +1516,7 @@ class GhostProtocolUnified:
                 pass
 
         cleaned = 0
+        tcc_blocked = []
         for label, db in paths.items():
             if os.path.exists(db):
                 try:
@@ -1525,8 +1526,28 @@ class GhostProtocolUnified:
                         os.remove(db)
                     self.log(f"Cleaned: {label}", "success")
                     cleaned += 1
+                except PermissionError:
+                    # Escalate to admin rm for TCC-protected files
+                    escaped = db.replace("'", "'\\''")
+                    if os.path.isdir(db):
+                        ret, _, stderr = self.run_as_admin(f"rm -rf '{escaped}'")
+                    else:
+                        ret, _, stderr = self.run_as_admin(f"rm -f '{escaped}'")
+                    if ret == 0 and not os.path.exists(db):
+                        self.log(f"Cleaned (admin): {label}", "success")
+                        cleaned += 1
+                    elif "User canceled" in stderr:
+                        self.log(f"Skipped {label}: auth canceled.", "warning")
+                    else:
+                        tcc_blocked.append(label)
+                        self.log(f"TCC blocked: {label}", "warning")
                 except Exception as e:
                     self.log(f"Failed: {label}: {e}", "warning")
+
+        if tcc_blocked:
+            self.log("Some files are protected by macOS TCC.", "warning")
+            self.log("Fix: System Settings → Privacy & Security → Full Disk Access → enable Python / Ghost Protocol.", "info")
+
         self.log(f"Browser purge done. Wiped {cleaned} items.", "success")
 
     def erase_clipboard(self):
