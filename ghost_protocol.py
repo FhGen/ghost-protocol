@@ -2,6 +2,7 @@
 import os
 import sys
 import subprocess
+import shlex
 import shutil
 import random
 import threading
@@ -861,7 +862,7 @@ class GhostProtocolUnified:
             except Exception as e:
                 return 1, "", str(e)
         else:
-            escaped_cmd = command.replace('"', '\\"')
+            escaped_cmd = command.replace('\\', '\\\\').replace('"', '\\"')
             applescript = f'do shell script "{escaped_cmd}" with administrator privileges'
             try:
                 res = subprocess.run(["osascript", "-e", applescript], capture_output=True, text=True)
@@ -939,10 +940,28 @@ class GhostProtocolUnified:
     def wifi_drop(self):
         self.log("Severing active Wi-Fi connection...", "warning")
         success = False
+        
         try:
-            res = subprocess.run(["wdutil", "disassociate"], capture_output=True)
-            if res.returncode == 0:
-                success = True
+            res = subprocess.run(
+                ["networksetup", "-listallhardwareports"],
+                capture_output=True, text=True
+            )
+            interface = None
+            lines = res.stdout.splitlines()
+            for i, line in enumerate(lines):
+                if "Wi-Fi" in line and i + 1 < len(lines):
+                    parts = lines[i+1].split(":")
+                    if len(parts) > 1:
+                        interface = parts[1].strip()
+                        break
+            
+            if interface:
+                res2 = subprocess.run(
+                    ["networksetup", "-setairportpower", interface, "off"],
+                    capture_output=True
+                )
+                if res2.returncode == 0:
+                    success = True
         except Exception:
             pass
 
@@ -959,7 +978,7 @@ class GhostProtocolUnified:
         if success:
             self.log("Wi-Fi connection severed.", "success")
         else:
-            self.log("Wi-Fi disassociate failed.", "error")
+            self.log("Wi-Fi disassociate failed. You may need to run as root.", "error")
 
     def strip_exif_data(self):
         if not self.shred_list:
@@ -1517,10 +1536,10 @@ class GhostProtocolUnified:
                 try:
                     for item in os.listdir(path):
                         item_path = os.path.join(path, item)
-                        if os.path.isdir(item_path):
-                            shutil.rmtree(item_path, ignore_errors=True)
-                        else:
+                        if os.path.islink(item_path) or os.path.isfile(item_path):
                             os.remove(item_path)
+                        elif os.path.isdir(item_path):
+                            shutil.rmtree(item_path, ignore_errors=True)
                     wiped += 1
                 except Exception:
                     pass
@@ -1614,10 +1633,10 @@ class GhostProtocolUnified:
             for item in os.listdir(p):
                 item_path = os.path.join(p, item)
                 try:
-                    if os.path.isdir(item_path):
-                        shutil.rmtree(item_path, ignore_errors=True)
-                    else:
+                    if os.path.islink(item_path) or os.path.isfile(item_path):
                         os.remove(item_path)
+                    elif os.path.isdir(item_path):
+                        shutil.rmtree(item_path, ignore_errors=True)
                     purged += 1
                 except Exception:
                     pass
@@ -1708,11 +1727,10 @@ class GhostProtocolUnified:
                     cleaned += 1
                 except PermissionError:
                     # Escalate to admin rm for TCC-protected files
-                    escaped = db.replace("'", "'\\''")
                     if os.path.isdir(db):
-                        ret, _, stderr = self.run_as_admin(f"rm -rf '{escaped}'")
+                        ret, _, stderr = self.run_as_admin(f"rm -rf {shlex.quote(db)}")
                     else:
-                        ret, _, stderr = self.run_as_admin(f"rm -f '{escaped}'")
+                        ret, _, stderr = self.run_as_admin(f"rm -f {shlex.quote(db)}")
                     if ret == 0 and not os.path.exists(db):
                         self.log(f"Cleaned (admin): {label}", "success")
                         cleaned += 1
