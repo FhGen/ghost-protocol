@@ -7,6 +7,7 @@ import random
 import threading
 import json
 import ssl
+import socket
 import urllib.request
 import tempfile
 import atexit
@@ -273,6 +274,7 @@ class GhostProtocolUnified:
         self.tor_process = None
         self.shred_list = []
         self.fetched_relays = {}
+        self._tor_control_password = None
 
         # Panic hotkey
         self.root.bind("<Escape>", lambda e: self.trigger_panic())
@@ -687,25 +689,33 @@ class GhostProtocolUnified:
         tor_ops.columnconfigure(0, weight=1)
         tor_ops.columnconfigure(1, weight=1)
         tor_ops.columnconfigure(2, weight=1)
+        tor_ops.columnconfigure(3, weight=1)
 
-        self.btn_tor_run = GhostButton(tor_ops, "▶ START TOR",
+        self.btn_tor_run = GhostButton(tor_ops, "▶ START",
             command=lambda: threading.Thread(target=self.enable_tor, daemon=True).start(),
             height=34, font=FONTS["button"], corner=4)
-        self.btn_tor_run.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.btn_tor_run.grid(row=0, column=0, sticky="ew", padx=(0, 3))
 
-        self.btn_tor_stop = GhostButton(tor_ops, "■ STOP TOR",
+        self.btn_tor_stop = GhostButton(tor_ops, "■ STOP",
             command=lambda: threading.Thread(target=self.stop_tor, daemon=True).start(),
             bg=COLORS["bg_elevated"], fg=COLORS["accent_orange"],
             hover_bg=COLORS["accent_orange"], hover_fg=COLORS["bg_deepest"],
             height=34, font=FONTS["button"], corner=4)
-        self.btn_tor_stop.grid(row=0, column=1, sticky="ew", padx=4)
+        self.btn_tor_stop.grid(row=0, column=1, sticky="ew", padx=3)
+
+        self.btn_tor_newid = GhostButton(tor_ops, "🔄 NEW IP",
+            command=lambda: threading.Thread(target=self.new_tor_identity, daemon=True).start(),
+            bg=COLORS["bg_elevated"], fg=COLORS["accent_purple"],
+            hover_bg=COLORS["accent_purple"], hover_fg=COLORS["bg_deepest"],
+            height=34, font=FONTS["button"], corner=4)
+        self.btn_tor_newid.grid(row=0, column=2, sticky="ew", padx=3)
 
         self.btn_tor_test = GhostButton(tor_ops, "⚡ TEST",
             command=lambda: threading.Thread(target=self.test_tor, daemon=True).start(),
             bg=COLORS["bg_elevated"], fg=COLORS["accent_cyan"],
             hover_bg=COLORS["accent_cyan"], hover_fg=COLORS["bg_deepest"],
             height=34, font=FONTS["button"], corner=4)
-        self.btn_tor_test.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        self.btn_tor_test.grid(row=0, column=3, sticky="ew", padx=(3, 0))
 
         # Bind events
         exit_menu.bind("<<ComboboxSelected>>", self.on_exit_country_change)
@@ -1073,8 +1083,22 @@ class GhostProtocolUnified:
         torrc_lines = [
             "SocksPort 127.0.0.1:9050",
             "ControlPort 127.0.0.1:9051",
-            "CookieAuthentication 1"
         ]
+
+        # Generate a random control password for this session
+        self._tor_control_password = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=24))
+        try:
+            hash_res = subprocess.run(
+                [self.tor_bin, "--hash-password", self._tor_control_password],
+                capture_output=True, text=True, timeout=5
+            )
+            if hash_res.returncode == 0:
+                hashed = hash_res.stdout.strip().split("\n")[-1]
+                torrc_lines.append(f"HashedControlPassword {hashed}")
+            else:
+                torrc_lines.append("CookieAuthentication 1")
+        except Exception:
+            torrc_lines.append("CookieAuthentication 1")
 
         if hasattr(self, "exclude_five_eyes_toggle") and self.exclude_five_eyes_toggle.is_on:
             five_eyes = "{us},{gb},{ca},{au},{nz}"
@@ -1199,6 +1223,54 @@ class GhostProtocolUnified:
         except Exception as e:
             self.log(f"Connectivity check failed: {e}", "error")
             self.root.after(0, lambda: self.tor_status_dot.set_color(COLORS["accent_red"]))
+
+    def new_tor_identity(self):
+        """Request a new Tor circuit (new IP) via SIGNAL NEWNYM on the control port."""
+        if not self.tor_process or self.tor_process.poll() is not None:
+            self.log("Tor is not running. Start Tor first.", "warning")
+            return
+
+        if not self._tor_control_password:
+            self.log("No control password set. Restart Tor to enable identity switching.", "error")
+            return
+
+        self.log("Requesting new Tor identity (NEWNYM)...", "info")
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(("127.0.0.1", 9051))
+
+            # Read greeting
+            sock.recv(1024)
+
+            # Authenticate
+            sock.sendall(f'AUTHENTICATE "{self._tor_control_password}"\r\n'.encode())
+            auth_resp = sock.recv(1024).decode()
+            if "250" not in auth_resp:
+                self.log(f"Control port auth failed: {auth_resp.strip()}", "error")
+                sock.close()
+                return
+
+            # Send NEWNYM
+            sock.sendall(b"SIGNAL NEWNYM\r\n")
+            newnym_resp = sock.recv(1024).decode()
+            sock.sendall(b"QUIT\r\n")
+            sock.close()
+
+            if "250" in newnym_resp:
+                self.log("New identity requested. Circuit will rebuild in ~10s.", "success")
+                # Wait for new circuit and show new IP
+                time.sleep(3)
+                self.test_tor()
+            else:
+                self.log(f"NEWNYM failed: {newnym_resp.strip()}", "error")
+
+        except ConnectionRefusedError:
+            self.log("Control port (9051) refused. Is Tor running?", "error")
+        except socket.timeout:
+            self.log("Control port timed out.", "error")
+        except Exception as e:
+            self.log(f"Identity switch error: {e}", "error")
 
     def on_tor_toggle(self, is_on):
         if not is_on:
